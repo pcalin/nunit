@@ -52,8 +52,25 @@ namespace NUnit.Engine.Runners
         {
             var results = new List<TestEngineResult>();
 
-            foreach (ITestEngineRunner runner in _runners)
-                results.Add(runner.Explore(filter));
+            var levelOfParallelism = GetLevelOfParallelism();
+            var disposeRunners = TestPackage.GetSetting(PackageSettings.DisposeRunners, false);
+
+            var workerPool = new ParallelTaskWorkerPool(levelOfParallelism);
+            var tasks = new List<SimpleTestExecutionTask<TestEngineResult>>();
+
+            foreach (var subPackage in TestPackage.SubPackages)
+            {
+                var task = new SimpleTestExecutionTask<TestEngineResult>(() => CreateRunner(subPackage),
+                    x => x.Explore(filter), disposeRunners);
+                tasks.Add(task);
+                workerPool.Enqueue(task);
+            }
+
+            workerPool.Start();
+            workerPool.WaitAll();
+
+            foreach (var task in tasks)
+                results.Add(task.Result());
 
             TestEngineResult result = ResultHelper.Merge(results);
 
@@ -70,12 +87,12 @@ namespace NUnit.Engine.Runners
         {
             var results = new List<TestEngineResult>();
 
-            foreach (var subPackage in TestPackage.SubPackages)
-            {
-                var runner = CreateRunner(subPackage);
-                _runners.Add(runner);
-                results.Add(runner.Load());
-            }
+            //foreach (var subPackage in TestPackage.SubPackages)
+            //{
+            //    var runner = CreateRunner(subPackage);
+            //    _runners.Add(runner);
+            //    results.Add(runner.Load());
+            //}
 
             return ResultHelper.Merge(results);
         }
@@ -85,8 +102,6 @@ namespace NUnit.Engine.Runners
         /// </summary>
         public override void UnloadPackage()
         {
-            foreach (ITestEngineRunner runner in _runners)
-                runner.Unload();
         }
 
         /// <summary>
@@ -97,11 +112,27 @@ namespace NUnit.Engine.Runners
         /// <returns>The count of test cases</returns>
         protected override int CountTests(TestFilter filter)
         {
-            int count = 0;
+            var count = 0;
+            var levelOfParallelism = GetLevelOfParallelism();
+            var disposeRunners = TestPackage.GetSetting(PackageSettings.DisposeRunners, false);
 
-            foreach (ITestEngineRunner runner in _runners)
-                count += runner.CountTestCases(filter);
+            var workerPool = new ParallelTaskWorkerPool(levelOfParallelism);
+            var tasks = new List<SimpleTestExecutionTask<int>>();
 
+            foreach (var subPackage in TestPackage.SubPackages)
+            {
+                var task = new SimpleTestExecutionTask<int>(() => CreateRunner(subPackage),
+                    x => x.CountTestCases(filter), disposeRunners);
+                tasks.Add(task);
+                workerPool.Enqueue(task);
+            }
+
+            workerPool.Start();
+            workerPool.WaitAll();
+
+            foreach (var task in tasks)
+                count += task.Result();
+            
             return count;
         }
 
@@ -121,10 +152,12 @@ namespace NUnit.Engine.Runners
 
             int levelOfParallelism = GetLevelOfParallelism();
 
-            if (levelOfParallelism <= 1 || _runners.Count <= 1)
+            if (levelOfParallelism <= 1 || TestPackage.SubPackages.Count <= 1)
             {
-                foreach (ITestEngineRunner runner in _runners)
+                foreach (var subpackage in TestPackage.SubPackages)
                 {
+                    var runner = CreateRunner(subpackage);
+                    runner.Load();
                     results.Add(runner.Run(listener, filter));
                     if (disposeRunners) runner.Dispose();
                 }
@@ -132,11 +165,12 @@ namespace NUnit.Engine.Runners
             else
             {
                 var workerPool = new ParallelTaskWorkerPool(levelOfParallelism);
-                var tasks = new List<TestExecutionTask>();
+                var tasks = new List<SimpleTestExecutionTask<TestEngineResult>>();
 
-                foreach (ITestEngineRunner runner in _runners)
+                foreach (var subPackage in TestPackage.SubPackages)
                 {
-                    var task = new TestExecutionTask(runner, listener, filter, disposeRunners);
+                    var task = new SimpleTestExecutionTask<TestEngineResult>(() => CreateRunner(subPackage),
+                        x => x.Run(listener, filter), disposeRunners);
                     tasks.Add(task);
                     workerPool.Enqueue(task);
                 }
@@ -148,13 +182,41 @@ namespace NUnit.Engine.Runners
                     results.Add(task.Result());
             }
 
-            if (disposeRunners) _runners.Clear();
-
             TestEngineResult result = ResultHelper.Merge(results);
 
             return IsProjectPackage(TestPackage)
                 ? result.MakePackageResult(TestPackage.Name, TestPackage.FullName)
                 : result;
+        }
+        public delegate T Func<out T>();
+        public delegate TRes Func<in TIn, out TRes>(TIn input);
+        private class SimpleTestExecutionTask<TOut> : ITestExecutionTask
+        {
+            private TOut _result;
+            private readonly Func<ITestEngineRunner> _createRunner;
+            private readonly Func<ITestEngineRunner, TOut> _run;
+            private readonly bool _disposeRunner;
+
+            public SimpleTestExecutionTask(Func<ITestEngineRunner> createRunner, Func<ITestEngineRunner, TOut> run, bool disposeRunner)
+            {
+                _createRunner = createRunner;
+                _run = run;
+                _disposeRunner = disposeRunner;
+            }
+
+            public void Execute()
+            {
+                var runner = _createRunner();
+                runner.Load();
+                _result = _run(runner);
+                if (_disposeRunner)
+                    runner.Dispose();
+            }
+
+            public TOut Result()
+            {
+                return _result;
+            }
         }
 
         /// <summary>
@@ -163,18 +225,6 @@ namespace NUnit.Engine.Runners
         /// <param name="force">If true, cancel any ongoing test threads, otherwise wait for them to complete.</param>
         public override void StopRun(bool force)
         {
-            foreach (var runner in _runners)
-                runner.StopRun(force);
-        }
-
-        protected override void Dispose(bool disposing)
-        {
-            base.Dispose(disposing);
-
-            foreach (var runner in _runners)
-                runner.Dispose();
-
-            _runners.Clear();
         }
 
         #endregion
